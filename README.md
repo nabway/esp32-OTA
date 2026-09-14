@@ -1,53 +1,195 @@
-# ESP32 Relay-Clap
+# ESP32 OTA Manager
 
-If you've ever wished you could just clap to turn on the lights, this is that project
+HTTP-based firmware updates for ESP32 with automatic rollback protection and Telegram bot control.
 
-This project pairs an ESP32 DevKit (mic + clap detection) with an Athom
-Smart Plug V3 (running ESPHome on an ESP32-C3) that actually drives the
-relay. The two talk to each other over MQTT.
+## Features
 
-## How it works (in short)
+- **OTA over HTTP** — download and flash firmware without USB cable
+- **Automatic rollback** — if new image crashes within 8s, bootloader reverts automatically
+- **Telegram bot** — trigger updates from your phone (`/ota http://...`)
+- **Dual partitions** — safe concurrent OTA (app0 ↔ app1)
+- **Multi-network WiFi** — connect to up to 3 SSIDs with 30s timeout
+- **OLED display** — shows current version, last known good, WiFi state and IP
+- **NTP sync** — accurate timestamps for logging
+- **Serial fallback** — trigger OTA via USB if needed
 
-One ESP32 listens for claps through a mic, the other one controls the
-smart plug the lamp is plugged into. When it hears a clap, it tells the
-plug to flip the relay.
-
-I'm building this step by step: get the plug responding to basic commands
-first, then add remote control via Telegram, then move everything to MQTT,
-and only at the end add the actual clap detection. One thing at a time.
-Right now: v0.1, just validating HTTP connectivity to the plug.
-
-## What's in here right now
-
-- `src/main.cpp` - v0.1 sketch. Toggles the plug's relay every 10s via the
-  ESPHome `web_server` REST API (`/switch/switch/toggle`), basically to
-  confirm both devices can talk to each other before anything fancier.
-
-## Build & flash
-
-Built with [PlatformIO](https://platformio.org/) on the Arduino framework.
+## Project Structure
 
 ```
-pio run
-pio run -t upload
-pio device monitor
+esp32-OTA/
+├── src/
+│   ├── main.cpp              ← entry point + loop orchestration
+│   ├── ota/                  ← OTA manager (HTTP download + flash)
+│   │   └── ota_manager.cpp
+│   ├── cloud/                ← Telegram bot
+│   │   └── telegram_bot.cpp
+│   ├── net/                  ← WiFi manager
+│   │   └── wifi_manager.cpp
+│   ├── display/              ← OLED screen
+│   │   └── oled.cpp
+│   └── features/             ← ADD YOUR CODE HERE
+│       ├── led_example.cpp   ← Example
+│       └── led_example.hpp
+│
+├── include/
+│   ├── config/
+│   │   ├── secrets.hpp       ← WiFi + Telegram credentials
+│   │   └── pins.hpp          ← GPIO
+│   └── features/
+│       └── led_example.hpp
+│
+└── scripts/
+    ├── serve_firmware.py     ← HTTP server for OTA
+    ├── build_and_publish.sh  ← build + copy firmware update
+    └── send_telegram_ota.sh  ← shortcut to trigger OTA service
 ```
 
-## Roadmap
+## Execution Flow
 
-1. v0.1 - HTTP toggle every 10s, just to validate connectivity with the
-   ESPHome `web_server` API.
-2. v0.2 - Telegram bot (long polling) to send on/off/toggle commands.
-3. v0.3 - Move to MQTT via HiveMQ (cloud, TLS). The plug subscribes to a
-   command topic, the DevKit publishes to it instead of using direct HTTP.
-4. v0.4 - This is the fun part: add a mic (I2S, probably an INMP441) and
-   build the clap detector. RMS energy + threshold, with a small state
-   machine to catch double claps.
-5. v1.0 - Everything connected: clap -> MQTT via HiveMQ -> plug toggles the
-   relay. Trying to keep it under 500ms, otherwise it'll feel laggy.
-6. v2.0 - Add a local Mosquitto broker on a Raspberry Pi as a fallback, so
-   if my wifi dies I'm not stuck with a lamp I can't turn off.
+```
+SETUP PHASE
+├─ Serial.begin()
+├─ WiFiManager::begin()       [auto]
+├─ configTime() + NTP sync    [auto]
+├─ TelegramBot::begin()       [auto]
+├─ OTA::begin()               [auto]
+├─ Display::begin()           [auto]
+└─ app::setup()               [YOUR CODE RUNS HERE]
+
+LOOP PHASE (continuous)
+├─ WiFiManager::loop()        [auto]
+├─ TelegramBot::poll()        [auto] → handles /status, /ota, etc.
+├─ OTA::loop()                [auto] → validates firmware after 8s
+├─ Serial input handler       [auto] → U<url> or X for testing
+└─ app::loop()                [YOUR CODE RUNS HERE]
+```
+
+## Quick Start
+
+### 1. Set up Telegram bot
+
+```bash
+# In Telegram, message @BotFather
+/newbot
+# Save the TOKEN
+
+# Send any message to your bot, then:
+curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[0].message.chat.id'
+# Save the CHAT_ID
+```
+
+### 2. Configure credentials
+
+Edit `include/config/secrets.hpp`:
+
+```cpp
+static const char TELEGRAM_TOKEN[]   = "<YOUR_TOKEN>";
+static const char TELEGRAM_CHAT_ID[] = "<YOUR_CHAT_ID>";
+```
+
+### 3. Flash initial firmware
+
+First board flash requires USB cable:
+
+```bash
+cp include/config/secrets.example.hpp include/config/secrets.hpp
+# Edit secrets.hpp with your credentials
+
+pio run -e esp32dev -t upload --upload-port /dev/cu.usbserial-*
+```
+
+All future updates go over OTA.
+
+### 4. Update firmware over OTA
+
+```bash
+# Terminal 1: Build and serve
+./scripts/build_and_publish.sh
+cd scripts/serve_dir && python3 ../serve_firmware.py
+
+# Terminal 2: Get your LAN IP
+ipconfig getifaddr en0
+
+# Terminal 3: Trigger update
+./scripts/send_telegram_ota.sh http://192.168.x.x:8000/firmware.bin
+```
+
+Bot will reply:
+- `Starting OTA — downloading firmware`
+- `OTA written successfully — rebooting`
+- `🔌 Smart Plug Bot online` (after reboot)
+
+After 8 seconds of stable boot, firmware auto-validates and rollback is cancelled.
+
+## Adding Your Code
+
+1. Create new files in `src/features/` (e.g., `relay.cpp`)
+2. Add header in `include/features/` (e.g., `relay.hpp`)
+3. Edit `src/main.cpp` includes:
+
+```cpp
+#include "features/relay.hpp"
+```
+
+4. Call your functions:
+
+```cpp
+void setup() {
+    // ... framework init ...
+    relay::setup();   // YOUR CODE
+}
+
+void loop() {
+    // ... framework loops ...
+    relay::loop();    // YOUR CODE
+}
+```
+
+Reference: `src/features/led_example.cpp` shows a minimal hello-world with LED blink.
+
+## OTA Error Codes
+
+| Code | Cause |
+|------|-------|
+| `1` | Success (rebooting) |
+| `-1` | No WiFi connection |
+| `-2` | Invalid URL (use `http://`, not `https://`) |
+| `-3` | Server unreachable (wrong IP, different network) |
+| `-4` | Binary too large for OTA partition |
+| `-5` | Corrupted image (failed validation) |
+| `-6` | Incomplete download |
+
+## Serial Commands
+
+If connected via USB:
+
+- `Uhttp://host:8000/firmware.bin` — trigger OTA via serial
+- `X` — force crash to test rollback mechanism
+
+## Telegram Commands
+
+Customize in `src/cloud/telegram_bot.cpp`:
+
+- `/ota http://host:8000/firmware.bin` — trigger firmware update
+- `/status` — show current state
+- `/on`, `/off`, `/toggle` — smart plug control (example)
+
+## Technical Deep-Dive
+
+See [docs/OTA_ARCHITECTURE.md](docs/OTA_ARCHITECTURE.md) for:
+- Complete sequence diagram (8 phases)
+- Partition state machine
+- Timing constraints
+- What happens during rollback
+
+## Hardware
+
+**Tested on:** ESP32-DevKit-V1 (30-pin)
+
+**Display:** SSD1306 128x64 OLED on I2C (GPIO 21/22, address 0x3C)
+
+**LED:** GPIO 2 (built-in blue LED) — configurable in `include/features/led_example.hpp`
 
 ## License
 
-MIT
+—

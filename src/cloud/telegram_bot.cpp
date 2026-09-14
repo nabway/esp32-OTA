@@ -5,6 +5,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include "ota/ota_manager.hpp"
 
 namespace cloud {
 
@@ -134,6 +135,25 @@ static void handleCommand(const char* chat_id, const char* text) {
         postMessageWithKeyboard(chat_id, device::SmartPlug::turnOff() ? "Turning OFF" : "Failed to turn OFF");
     } else if (strcmp(text, "/toggle") == 0) {
         postMessageWithKeyboard(chat_id, device::SmartPlug::toggle()  ? "Toggled"     : "Failed to toggle");
+    } else if (strncmp(text, "/ota", 4) == 0) {
+        // /ota http://host/firmware.bin
+        const char* p = text + 4;
+        while (*p == ' ') ++p;
+        if (*p == '\0') {
+            postMessageWithKeyboard(chat_id, "Usage: /ota http://host/firmware.bin");
+        } else {
+            postMessageWithKeyboard(chat_id, "Starting OTA — downloading firmware");
+            int r = ota::performHttpUpdate(p);
+            if (r == 1) {
+                postMessageWithKeyboard(chat_id, "OTA written successfully — rebooting");
+                delay(1000);
+                ESP.restart();
+            } else {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "OTA failed (code %d)", r);
+                postMessageWithKeyboard(chat_id, buf);
+            }
+        }
     } else {
         postMessageWithKeyboard(chat_id, "Commands: /status /on /off /toggle");
     }
@@ -152,6 +172,8 @@ void TelegramBot::poll() {
 
     if (WiFi.status() != WL_CONNECTED) return;  // nothing to do without a link
 
+    log_i("Telegram: polling for updates...");
+
     WiFiClientSecure client;
     client.setInsecure();
 
@@ -163,7 +185,11 @@ void TelegramBot::poll() {
 
     http.begin(client, url);
     const int code = http.GET();
-    if (code != 200) { http.end(); return; }
+    if (code != 200) {
+        log_w("Telegram: getUpdates failed, HTTP %d", code);
+        http.end();
+        return;
+    }
 
     JsonDocument doc;
     const DeserializationError err = deserializeJson(doc, http.getStream());
@@ -171,6 +197,7 @@ void TelegramBot::poll() {
     if (err) { log_w("Telegram JSON parse failed: %s", err.c_str()); return; }
 
     JsonArray results = doc["result"].as<JsonArray>();
+    log_i("Telegram: got %d updates", results.size());
     if (results.isNull() || results.size() == 0) return;
 
     for (JsonObject update : results) {
