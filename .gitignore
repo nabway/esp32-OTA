@@ -6,3 +6,4 @@
 include/config/secrets.hpp
 .claude
 .idea/
+scripts/serve_dir/
